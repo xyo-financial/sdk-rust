@@ -1,6 +1,6 @@
 use wiremock::matchers::{bearer_token, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use xyo_sdk::client::{Client, DownloadSecurityPolicy, EnrichmentRequest, EnrichmentStatus};
+use xyo_sdk::client::{Client, DownloadSecurityPolicy, EnrichmentRequest, EnrichmentStatus, RequestOptions};
 
 #[tokio::test]
 async fn test_client_new_configuration() {
@@ -1166,4 +1166,198 @@ async fn test_enrich_transactions_client_side_batch_item_validation() {
     ];
     let err = client.enrich_transactions(requests, None).await.unwrap_err();
     assert!(err.message.contains("request at index 1 is invalid"));
+}
+
+#[tokio::test]
+async fn test_tracing_headers_enrich_transaction() {
+    let mock_server = MockServer::start().await;
+    let client = Client::new("test-token", Some(mock_server.uri())).unwrap();
+
+    let cid = "123e4567-e89b-12d3-a456-426614174000";
+    let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/ai/finance/enrichment/transaction"))
+        .and(header("X-Correlation-ID", cid))
+        .and(header("traceparent", tp))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "merchant": "Costa Coffee",
+            "description": "British coffeehouse chain",
+            "categories": ["Food & Beverage"],
+            "logo": "",
+            "location": "London",
+            "address": "High St"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let opts = RequestOptions::new()
+        .correlation_id(cid)
+        .traceparent(tp);
+
+    let resp = client
+        .enrich_transaction_with_options("COSTA", "GB", Some(&opts))
+        .await
+        .expect("enrich_transaction_with_options should succeed with tracing headers");
+
+    assert_eq!(resp.merchant, "Costa Coffee");
+}
+
+#[tokio::test]
+async fn test_tracing_headers_enrich_transactions() {
+    let mock_server = MockServer::start().await;
+    let client = Client::new("test-token", Some(mock_server.uri())).unwrap();
+
+    let cid = "corr-bulk-999";
+    let tp = "00-traceparent-bulk-01";
+    let user = "tenant-user-77";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/ai/finance/enrichment/transactions"))
+        .and(header("X-Correlation-ID", cid))
+        .and(header("traceparent", tp))
+        .and(header("x-api-user", user))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "job-bulk-tracing",
+            "link": "https://api.xyo.financial/download.tar.gz"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let opts = RequestOptions::new()
+        .correlation_id(cid)
+        .traceparent(tp)
+        .api_user(user);
+
+    let reqs = vec![EnrichmentRequest::new("UBER TRIP", "GB")];
+
+    let resp = client
+        .enrich_transactions_with_options(reqs, Some(&opts))
+        .await
+        .expect("enrich_transactions_with_options should succeed with tracing headers");
+
+    assert_eq!(resp.id, "job-bulk-tracing");
+}
+
+#[tokio::test]
+async fn test_tracing_headers_get_enrichment_status() {
+    let mock_server = MockServer::start().await;
+    let client = Client::new("test-token", Some(mock_server.uri())).unwrap();
+
+    let cid = "corr-status-111";
+    let tp = "00-traceparent-status-01";
+
+    Mock::given(method("GET"))
+        .and(path("/v1/ai/finance/enrichment/status/job-status-trace"))
+        .and(header("X-Correlation-ID", cid))
+        .and(header("traceparent", tp))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "READY"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let opts = RequestOptions::new()
+        .correlation_id(cid)
+        .traceparent(tp);
+
+    let status = client
+        .get_enrichment_status_with_options("job-status-trace", Some(&opts))
+        .await
+        .expect("get_enrichment_status_with_options should succeed with tracing headers");
+
+    assert_eq!(status, EnrichmentStatus::Ready);
+}
+
+#[tokio::test]
+async fn test_client_builder_default_tracing_headers() {
+    let mock_server = MockServer::start().await;
+    let client = Client::builder()
+        .token("test-token")
+        .base_url(mock_server.uri())
+        .correlation_id("builder-cid-123")
+        .traceparent("builder-tp-456")
+        .build()
+        .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/ai/finance/enrichment/transaction"))
+        .and(header("X-Correlation-ID", "builder-cid-123"))
+        .and(header("traceparent", "builder-tp-456"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "merchant": "Default Tracing Store",
+            "description": "Desc",
+            "categories": [],
+            "logo": "",
+            "location": "",
+            "address": ""
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let resp = client
+        .enrich_transaction("COSTA", "GB")
+        .await
+        .expect("should automatically attach default builder tracing headers");
+
+    assert_eq!(resp.merchant, "Default Tracing Store");
+}
+
+#[tokio::test]
+async fn test_rate_limit_429_header_parsing() {
+    let mock_server = MockServer::start().await;
+    let client = Client::new("test-token", Some(mock_server.uri())).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/ai/finance/enrichment/transaction"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string("{\"error\":\"Rate limit exceeded\"}")
+                .insert_header("content-type", "application/json")
+                .insert_header("Retry-After", "120")
+                .insert_header("RateLimit-Limit", "5000")
+                .insert_header("RateLimit-Remaining", "0")
+                .insert_header("RateLimit-Reset", "1700001000"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let err = client
+        .enrich_transaction("COSTA", "GB")
+        .await
+        .expect_err("should return ClientError for 429");
+
+    assert_eq!(err.code, 429);
+    assert!(err.is_rate_limited());
+    assert!(err.is_retryable());
+
+    let rl = err.rate_limit.expect("rate_limit info should be extracted");
+    assert_eq!(rl.retry_after, Some(120));
+    assert_eq!(rl.limit, Some(5000));
+    assert_eq!(rl.remaining, Some(0));
+    assert_eq!(rl.reset, Some(1700001000));
+}
+
+#[tokio::test]
+async fn test_batch_size_upper_bounds_validation() {
+    let client = Client::new("test-token", Some("https://api.xyo.financial".to_string())).unwrap();
+
+    let oversized_requests: Vec<EnrichmentRequest> = (0..50_001)
+        .map(|i| EnrichmentRequest {
+            content: format!("TX {}", i),
+            country_code: "GB".to_string(),
+        })
+        .collect();
+
+    let err = client
+        .enrich_transactions(oversized_requests, None)
+        .await
+        .expect_err("oversized batch (> 50,000 items) should fail validation");
+
+    assert_eq!(err.code, 0);
+    assert!(err.message.contains("exceeds maximum allowed limit of 50000 items"));
 }

@@ -89,9 +89,10 @@ pub async fn enrich_transaction(configuration: &configuration::Configuration, en
             ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `models::EnrichmentResponse`")))),
         }
     } else {
+        let headers = resp.headers().clone();
         let content = resp.text().await?;
         let entity: Option<EnrichTransactionError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent { status, content, entity }))
+        Err(Error::ResponseError(ResponseContent { status, content, entity, headers }))
     }
 }
 
@@ -142,9 +143,10 @@ pub async fn enrich_transactions(configuration: &configuration::Configuration, e
             ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `models::EnrichTransactionCollectionResponse`")))),
         }
     } else {
+        let headers = resp.headers().clone();
         let content = resp.text().await?;
         let entity: Option<EnrichTransactionsError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent { status, content, entity }))
+        Err(Error::ResponseError(ResponseContent { status, content, entity, headers }))
     }
 }
 
@@ -194,9 +196,10 @@ pub async fn get_enrichment_status(configuration: &configuration::Configuration,
             ContentType::Unsupported(unknown_type) => return Err(Error::from(serde_json::Error::custom(format!("Received `{unknown_type}` content type response that cannot be converted to `models::EnrichmentCollectionStatusResponse`")))),
         }
     } else {
+        let headers = resp.headers().clone();
         let content = resp.text().await?;
         let entity: Option<GetEnrichmentStatusError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent { status, content, entity }))
+        Err(Error::ResponseError(ResponseContent { status, content, entity, headers }))
     }
 }
 

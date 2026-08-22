@@ -1,5 +1,4 @@
 use xyo_sdk::client::Client;
-use xyo_sdk::error::ClientError;
 
 #[tokio::main]
 async fn main() {
@@ -12,12 +11,15 @@ async fn main() {
         Ok(resp) => {
             println!("Enrichment succeeded: {}", resp.merchant);
         }
-        Err(ClientError { code, message }) => {
+        Err(err) => {
             println!("Encountered ClientError:");
-            println!("  HTTP Status Code: {}", code);
-            println!("  Error Message:    {}", message);
+            println!("  HTTP Status Code: {}", err.code);
+            println!("  Error Message:    {}", err.message);
+            if let Some(rl) = &err.rate_limit {
+                println!("  RateLimit Info:   Retry-After={:?}, Limit={:?}, Remaining={:?}, Reset={:?}", rl.retry_after, rl.limit, rl.remaining, rl.reset);
+            }
 
-            match code {
+            match err.code {
                 401 => eprintln!("  Resolution: Verify your API key at https://xyo.financial/dashboard"),
                 400 | 422 => eprintln!("  Resolution: Check transaction content and ISO country code format"),
                 404 => eprintln!("  Resolution: Merchant or resource not found"),

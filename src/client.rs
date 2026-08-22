@@ -18,7 +18,42 @@ use xyo_openapi_client::apis::enrichment_api;
 use xyo_openapi_client::models::{EnrichmentRequest as ApiEnrichmentRequest, EnrichTransactionsRequestInner};
 use serde::{Deserialize, Serialize};
 
-use crate::error::ClientError;
+use crate::error::{extract_rate_limit_headers, ClientError, RateLimitError};
+
+/// Optional per-request configuration options (e.g. distributed tracing headers, tenant user ID).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RequestOptions {
+    /// Distributed tracing correlation identifier (`X-Correlation-ID` header).
+    pub correlation_id: Option<String>,
+    /// Distributed tracing traceparent header (`traceparent` header, W3C format).
+    pub traceparent: Option<String>,
+    /// Optional tenant user identifier (`x-api-user` header).
+    ///
+    /// Note: `api_user` is specifically used for bulk/batch operations (e.g. `enrich_transactions` and `get_enrichment_status`).
+    pub api_user: Option<String>,
+}
+
+impl RequestOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
+    pub fn traceparent(mut self, traceparent: impl Into<String>) -> Self {
+        self.traceparent = Some(traceparent.into());
+        self
+    }
+
+    pub fn api_user(mut self, api_user: impl Into<String>) -> Self {
+        self.api_user = Some(api_user.into());
+        self
+    }
+}
 
 // ── Null-safe string deserialization ──────────────────────────────────────────
 
@@ -90,29 +125,26 @@ impl EnrichmentRequest {
     pub fn validate(&self) -> Result<(), ClientError> {
         let content = self.content.trim();
         if content.is_empty() {
-            return Err(ClientError {
-                code: 0,
-                message: "request content must not be empty".to_string(),
-            });
+            return Err(ClientError::new(0, "request content must not be empty"));
         }
         if content.chars().count() > 128 {
-            return Err(ClientError {
-                code: 0,
-                message: "request content exceeds maximum length of 128 characters".to_string(),
-            });
+            return Err(ClientError::new(
+                0,
+                "request content exceeds maximum length of 128 characters",
+            ));
         }
         let country = self.country_code.trim();
         if country.is_empty() {
-            return Err(ClientError {
-                code: 0,
-                message: "request country_code must not be empty".to_string(),
-            });
+            return Err(ClientError::new(
+                0,
+                "request country_code must not be empty",
+            ));
         }
         if country.chars().count() != 2 {
-            return Err(ClientError {
-                code: 0,
-                message: "request country_code must be a 2-letter ISO 3166-1 alpha-2 code".to_string(),
-            });
+            return Err(ClientError::new(
+                0,
+                "request country_code must be a 2-letter ISO 3166-1 alpha-2 code",
+            ));
         }
         Ok(())
     }
@@ -172,16 +204,20 @@ fn sanitize_entry_name(name: &str) -> String {
         .collect()
 }
 
-fn validate_api_user(api_user: Option<&str>) -> Result<(), ClientError> {
-    if let Some(user) = api_user {
-        if user.contains('\r') || user.contains('\n') {
-            return Err(ClientError {
-                code: 0,
-                message: "api_user contains invalid CRLF characters".to_string(),
-            });
+fn validate_header_value(val: Option<&str>) -> Result<(), ClientError> {
+    if let Some(v) = val {
+        if v.contains('\r') || v.contains('\n') {
+            return Err(ClientError::new(
+                0,
+                "header value contains invalid CRLF characters",
+            ));
         }
     }
     Ok(())
+}
+
+fn validate_api_user(api_user: Option<&str>) -> Result<(), ClientError> {
+    validate_header_value(api_user)
 }
 
 type TokenSupplier = std::sync::Arc<dyn Fn() -> String + Send + Sync>;
@@ -198,6 +234,8 @@ pub struct ClientBuilder {
     connect_timeout: Option<Duration>,
     download_policy: DownloadSecurityPolicy,
     custom_http_client: Option<reqwest::Client>,
+    correlation_id: Option<String>,
+    traceparent: Option<String>,
 }
 
 impl Default for ClientBuilder {
@@ -218,6 +256,8 @@ impl ClientBuilder {
             connect_timeout: Some(Duration::from_secs(10)),
             download_policy: DownloadSecurityPolicy::default(),
             custom_http_client: None,
+            correlation_id: None,
+            traceparent: None,
         }
     }
 
@@ -278,6 +318,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Set default distributed tracing correlation ID (`X-Correlation-ID` header).
+    pub fn correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
+    /// Set default distributed tracing traceparent header (`traceparent` header, W3C format).
+    pub fn traceparent(mut self, traceparent: impl Into<String>) -> Self {
+        self.traceparent = Some(traceparent.into());
+        self
+    }
+
     /// Build the configured [`Client`].
     pub fn build(self) -> Result<Client, ClientError> {
         let http_client = if let Some(client) = self.custom_http_client {
@@ -290,10 +342,7 @@ impl ClientBuilder {
             if let Some(cto) = self.connect_timeout {
                 builder = builder.connect_timeout(cto);
             }
-            builder.build().map_err(|e| ClientError {
-                code: 0,
-                message: format!("Failed to build HTTP client: {}", e),
-            })?
+            builder.build().map_err(|e| ClientError::new(0, format!("Failed to build HTTP client: {}", e)))?
         };
 
         let mut configuration = Configuration::new();
@@ -311,6 +360,8 @@ impl ClientBuilder {
             configuration,
             token_supplier: self.token_supplier,
             download_policy: self.download_policy,
+            default_correlation_id: self.correlation_id,
+            default_traceparent: self.traceparent,
         })
     }
 }
@@ -324,6 +375,8 @@ impl std::fmt::Debug for ClientBuilder {
             .field("timeout", &self.timeout)
             .field("connect_timeout", &self.connect_timeout)
             .field("download_policy", &self.download_policy)
+            .field("correlation_id", &self.correlation_id)
+            .field("traceparent", &self.traceparent)
             .finish()
     }
 }
@@ -336,6 +389,8 @@ pub struct Client {
     configuration: Configuration,
     token_supplier: Option<TokenSupplier>,
     download_policy: DownloadSecurityPolicy,
+    default_correlation_id: Option<String>,
+    default_traceparent: Option<String>,
 }
 
 impl std::fmt::Debug for Client {
@@ -395,17 +450,46 @@ impl Client {
         content: impl Into<String>,
         country_code: impl Into<String>,
     ) -> Result<EnrichmentResponse, ClientError> {
+        self.enrich_transaction_with_options(content, country_code, None).await
+    }
+
+    /// Enrich a single financial transaction synchronously with per-request options (distributed tracing, tenant user ID).
+    pub async fn enrich_transaction_with_options(
+        &self,
+        content: impl Into<String>,
+        country_code: impl Into<String>,
+        options: Option<&RequestOptions>,
+    ) -> Result<EnrichmentResponse, ClientError> {
         let content_str = content.into();
         let country_str = country_code.into();
         let req = EnrichmentRequest::new(&content_str, &country_str);
         req.validate()?;
 
-        tracing::debug!(country = %country_str, "enrich_transaction executing");
+        if let Some(opts) = options {
+            if opts.api_user.is_some() {
+                return Err(ClientError::new(
+                    0,
+                    "`api_user` is only applicable to bulk operations",
+                ));
+            }
+        }
+
+        let corr_id = options
+            .and_then(|o| o.correlation_id.as_deref())
+            .or(self.default_correlation_id.as_deref());
+        let traceparent = options
+            .and_then(|o| o.traceparent.as_deref())
+            .or(self.default_traceparent.as_deref());
+
+        validate_header_value(corr_id)?;
+        validate_header_value(traceparent)?;
+
+        tracing::debug!(country = %country_str, ?corr_id, ?traceparent, "enrich_transaction executing");
 
         let body = ApiEnrichmentRequest::new(content_str, country_str);
         let config = self.get_effective_config();
 
-        let resp = enrichment_api::enrich_transaction(&config, body, None, None)
+        let resp = enrichment_api::enrich_transaction(&config, body, corr_id, traceparent)
             .await
             .map_err(map_error)?;
 
@@ -429,33 +513,66 @@ impl Client {
         requests: impl IntoIterator<Item = EnrichmentRequest>,
         api_user: Option<&str>,
     ) -> Result<EnrichTransactionCollectionResponse, ClientError> {
+        let mut opts = RequestOptions::default();
+        if let Some(user) = api_user {
+            opts = opts.api_user(user);
+        }
+        self.enrich_transactions_with_options(requests, Some(&opts)).await
+    }
+
+    /// Enrich a collection of financial transactions asynchronously with per-request options.
+    pub async fn enrich_transactions_with_options(
+        &self,
+        requests: impl IntoIterator<Item = EnrichmentRequest>,
+        options: Option<&RequestOptions>,
+    ) -> Result<EnrichTransactionCollectionResponse, ClientError> {
+        let api_user = options.and_then(|o| o.api_user.as_deref());
         validate_api_user(api_user)?;
 
-        let raw_requests: Vec<EnrichmentRequest> = requests.into_iter().collect();
-        if raw_requests.is_empty() {
-            return Err(ClientError {
-                code: 0,
-                message: "requests batch cannot be empty".to_string(),
-            });
-        }
+        let corr_id = options
+            .and_then(|o| o.correlation_id.as_deref())
+            .or(self.default_correlation_id.as_deref());
+        let traceparent = options
+            .and_then(|o| o.traceparent.as_deref())
+            .or(self.default_traceparent.as_deref());
 
-        let mut items = Vec::with_capacity(raw_requests.len());
-        for (i, req) in raw_requests.iter().enumerate() {
-            req.validate().map_err(|e| ClientError {
-                code: 0,
-                message: format!("request at index {} is invalid: {}", i, e.message),
-            })?;
+        validate_header_value(corr_id)?;
+        validate_header_value(traceparent)?;
+
+        let iter = requests.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let initial_capacity = upper.unwrap_or(lower).min(DEFAULT_MAX_TAR_ENTRIES);
+        let mut items = Vec::with_capacity(initial_capacity);
+
+        for (i, req) in iter.enumerate() {
+            if i >= DEFAULT_MAX_TAR_ENTRIES {
+                return Err(ClientError::new(
+                    0,
+                    format!(
+                        "requests batch size exceeds maximum allowed limit of {} items",
+                        DEFAULT_MAX_TAR_ENTRIES
+                    ),
+                ));
+            }
+            req.validate().map_err(|e| ClientError::new(
+                0,
+                format!("request at index {} is invalid: {}", i, e.message),
+            ))?;
             items.push(EnrichTransactionsRequestInner {
-                content: req.content.clone(),
-                country_code: req.country_code.clone(),
+                content: req.content,
+                country_code: req.country_code,
             });
         }
 
-        tracing::debug!(batch_size = items.len(), user = ?api_user, "enrich_transactions batch submission");
+        if items.is_empty() {
+            return Err(ClientError::new(0, "requests batch cannot be empty"));
+        }
+
+        tracing::debug!(batch_size = items.len(), user = ?api_user, ?corr_id, ?traceparent, "enrich_transactions batch submission");
 
         let config = self.get_effective_config();
 
-        let resp = enrichment_api::enrich_transactions(&config, items, api_user, None, None)
+        let resp = enrichment_api::enrich_transactions(&config, items, api_user, corr_id, traceparent)
             .await
             .map_err(map_error)?;
 
@@ -473,11 +590,36 @@ impl Client {
         id: &str,
         api_user: Option<&str>,
     ) -> Result<EnrichmentStatus, ClientError> {
+        let mut opts = RequestOptions::default();
+        if let Some(user) = api_user {
+            opts = opts.api_user(user);
+        }
+        self.get_enrichment_status_with_options(id, Some(&opts)).await
+    }
+
+    /// Get the status of an asynchronous bulk enrichment job with per-request options.
+    pub async fn get_enrichment_status_with_options(
+        &self,
+        id: &str,
+        options: Option<&RequestOptions>,
+    ) -> Result<EnrichmentStatus, ClientError> {
+        let api_user = options.and_then(|o| o.api_user.as_deref());
         validate_api_user(api_user)?;
-        tracing::debug!(job_id = %id, user = ?api_user, "get_enrichment_status polling");
+
+        let corr_id = options
+            .and_then(|o| o.correlation_id.as_deref())
+            .or(self.default_correlation_id.as_deref());
+        let traceparent = options
+            .and_then(|o| o.traceparent.as_deref())
+            .or(self.default_traceparent.as_deref());
+
+        validate_header_value(corr_id)?;
+        validate_header_value(traceparent)?;
+
+        tracing::debug!(job_id = %id, user = ?api_user, ?corr_id, ?traceparent, "get_enrichment_status polling");
 
         let config = self.get_effective_config();
-        let resp = enrichment_api::get_enrichment_status(&config, id, api_user, None, None)
+        let resp = enrichment_api::get_enrichment_status(&config, id, api_user, corr_id, traceparent)
             .await
             .map_err(map_error)?;
 
@@ -502,43 +644,40 @@ impl Client {
     ) -> Result<Vec<EnrichmentResponse>, ClientError> {
         let trimmed_url = download_url.trim();
         if trimmed_url.is_empty() {
-            return Err(ClientError {
-                code: 0,
-                message: "download_url cannot be empty".to_string(),
-            });
+            return Err(ClientError::new(0, "download_url cannot be empty"));
         }
 
         let parsed_download_url = if let Ok(parsed) = url::Url::parse(trimmed_url) {
             if parsed.scheme() == "http" || parsed.scheme() == "https" {
                 parsed
             } else if !parsed.scheme().is_empty() && (trimmed_url.contains("://") || trimmed_url.starts_with("javascript:") || trimmed_url.starts_with("data:")) {
-                return Err(ClientError {
-                    code: 0,
-                    message: format!("Unsupported URL scheme {:?} (only http and https are permitted)", parsed.scheme()),
-                });
+                return Err(ClientError::new(
+                    0,
+                    format!("Unsupported URL scheme {:?} (only http and https are permitted)", parsed.scheme()),
+                ));
             } else {
                 let base_clean = self.configuration.base_path.trim_end_matches('/');
                 let rel_clean = trimmed_url.trim_start_matches('/');
-                url::Url::parse(&format!("{}/{}", base_clean, rel_clean)).map_err(|e| ClientError {
-                    code: 0,
-                    message: format!("Invalid download URL: {}", e),
-                })?
+                url::Url::parse(&format!("{}/{}", base_clean, rel_clean)).map_err(|e| ClientError::new(
+                    0,
+                    format!("Invalid download URL: {}", e),
+                ))?
             }
         } else {
             let base_clean = self.configuration.base_path.trim_end_matches('/');
             let rel_clean = trimmed_url.trim_start_matches('/');
-            url::Url::parse(&format!("{}/{}", base_clean, rel_clean)).map_err(|e| ClientError {
-                code: 0,
-                message: format!("Invalid download URL: {}", e),
-            })?
+            url::Url::parse(&format!("{}/{}", base_clean, rel_clean)).map_err(|e| ClientError::new(
+                0,
+                format!("Invalid download URL: {}", e),
+            ))?
         };
 
         let scheme = parsed_download_url.scheme();
         if scheme != "http" && scheme != "https" {
-            return Err(ClientError {
-                code: 0,
-                message: format!("Unsupported URL scheme {:?} (only http and https are permitted)", scheme),
-            });
+            return Err(ClientError::new(
+                0,
+                format!("Unsupported URL scheme {:?} (only http and https are permitted)", scheme),
+            ));
         }
 
         let mut req_builder = self.configuration.client.get(parsed_download_url.as_str());
@@ -557,10 +696,10 @@ impl Client {
             .unwrap_or("");
 
         if !self.download_policy.is_allowed(down_host, api_host) {
-            return Err(ClientError {
-                code: 0,
-                message: format!("domain {:?} is not permitted for secure archive downloads", down_host),
-            });
+            return Err(ClientError::new(
+                0,
+                format!("domain {:?} is not permitted for secure archive downloads", down_host),
+            ));
         }
 
         if let Some(ref base_parsed) = base_url_parsed {
@@ -589,17 +728,21 @@ impl Client {
             "application/gzip, application/x-tar, application/octet-stream;q=0.9, */*;q=0.8",
         );
 
-        let resp = req_builder.send().await.map_err(|e| ClientError {
-            code: e.status().map(|s| s.as_u16()).unwrap_or(0),
-            message: e.to_string(),
-        })?;
+        let resp = req_builder.send().await.map_err(|e| ClientError::new(
+            e.status().map(|s| s.as_u16()).unwrap_or(0),
+            e.to_string(),
+        ))?;
 
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
+            let code = status.as_u16();
+            let rate_limit = extract_rate_limit_headers(resp.headers())
+                .or_else(|| if code == 429 { Some(RateLimitError::default()) } else { None });
             let message = resp.text().await.unwrap_or_default();
             return Err(ClientError {
-                code: status.as_u16(),
+                code,
                 message,
+                rate_limit,
             });
         }
 
@@ -617,26 +760,26 @@ impl Client {
                 && !ct_lower.contains("octet-stream")
                 && !ct_lower.contains("binary")
             {
-                return Err(ClientError {
-                    code: status.as_u16(),
-                    message: format!(
+                return Err(ClientError::new(
+                    status.as_u16(),
+                    format!(
                         "Unexpected Content-Type {:?} received when expecting binary archive",
                         ct_str
                     ),
-                });
+                ));
             }
         }
 
         // Early check for Content-Length header to prevent buffering oversized payloads
         if let Some(content_length) = resp.content_length() {
             if content_length > DEFAULT_MAX_ARCHIVE_BYTES as u64 {
-                return Err(ClientError {
-                    code: 0,
-                    message: format!(
+                return Err(ClientError::new(
+                    0,
+                    format!(
                         "Content-Length ({} bytes) exceeds maximum limit of {} bytes",
                         content_length, DEFAULT_MAX_ARCHIVE_BYTES
                     ),
-                });
+                ));
             }
         }
 
@@ -649,18 +792,18 @@ impl Client {
         let mut buffer = Vec::with_capacity(initial_capacity);
 
         let mut resp = resp;
-        while let Some(chunk) = resp.chunk().await.map_err(|e| ClientError {
-            code: e.status().map(|s| s.as_u16()).unwrap_or(0),
-            message: format!("Network stream error: {}", e),
-        })? {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| ClientError::new(
+            e.status().map(|s| s.as_u16()).unwrap_or(0),
+            format!("Network stream error: {}", e),
+        ))? {
             if buffer.len() + chunk.len() > DEFAULT_MAX_ARCHIVE_BYTES {
-                return Err(ClientError {
-                    code: 0,
-                    message: format!(
+                return Err(ClientError::new(
+                    0,
+                    format!(
                         "Compressed archive exceeded maximum allowed size of {} bytes",
                         DEFAULT_MAX_ARCHIVE_BYTES
                     ),
-                });
+                ));
             }
             buffer.extend_from_slice(&chunk);
         }
@@ -670,10 +813,10 @@ impl Client {
             let gz_decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(buffer));
             let mut archive = tar::Archive::new(gz_decoder);
 
-            let entries = archive.entries().map_err(|e| ClientError {
-                code: 0,
-                message: format!("Failed to read tar archive: {}", e),
-            })?;
+            let entries = archive.entries().map_err(|e| ClientError::new(
+                0,
+                format!("Failed to read tar archive: {}", e),
+            ))?;
 
             let mut results = Vec::new();
             let mut entry_count: usize = 0;
@@ -681,33 +824,33 @@ impl Client {
             for entry_res in entries {
                 entry_count += 1;
                 if entry_count > DEFAULT_MAX_TAR_ENTRIES {
-                    return Err(ClientError {
-                        code: 0,
-                        message: format!("Archive contains too many entries (exceeded limit of {})", DEFAULT_MAX_TAR_ENTRIES),
-                    });
+                    return Err(ClientError::new(
+                        0,
+                        format!("Archive contains too many entries (exceeded limit of {})", DEFAULT_MAX_TAR_ENTRIES),
+                    ));
                 }
 
-                let mut entry = entry_res.map_err(|e| ClientError {
-                    code: 0,
-                    message: format!("Failed to read tar entry: {}", e),
-                })?;
+                let mut entry = entry_res.map_err(|e| ClientError::new(
+                    0,
+                    format!("Failed to read tar entry: {}", e),
+                ))?;
 
                 let entry_size = entry.header().size().unwrap_or(0);
                 if entry_size > DEFAULT_MAX_ENTRY_BYTES {
                     let name = entry.path().map(|p| p.display().to_string()).unwrap_or_default();
-                    return Err(ClientError {
-                        code: 0,
-                        message: format!("Entry {:?} size ({} bytes) exceeds limit of {} bytes", sanitize_entry_name(&name), entry_size, DEFAULT_MAX_ENTRY_BYTES),
-                    });
+                    return Err(ClientError::new(
+                        0,
+                        format!("Entry {:?} size ({} bytes) exceeds limit of {} bytes", sanitize_entry_name(&name), entry_size, DEFAULT_MAX_ENTRY_BYTES),
+                    ));
                 }
 
                 let is_file = entry.header().entry_type().is_file();
                 let path_buf = entry
                     .path()
-                    .map_err(|e| ClientError {
-                        code: 0,
-                        message: format!("Failed to read tar entry path: {}", e),
-                    })?
+                    .map_err(|e| ClientError::new(
+                        0,
+                        format!("Failed to read tar entry path: {}", e),
+                    ))?
                     .into_owned();
 
                 // Zip-Slip and path traversal protection
@@ -719,10 +862,10 @@ impl Client {
                 if is_file {
                     if let Some(ext) = path_buf.extension() {
                         if ext == "json" {
-                            let item: EnrichmentResponse = serde_json::from_reader(&mut entry).map_err(|e| ClientError {
-                                code: 0,
-                                message: format!("Failed to parse JSON from {}: {}", sanitize_entry_name(&path_buf.display().to_string()), e),
-                            })?;
+                            let item: EnrichmentResponse = serde_json::from_reader(&mut entry).map_err(|e| ClientError::new(
+                                0,
+                                format!("Failed to parse JSON from {}: {}", sanitize_entry_name(&path_buf.display().to_string()), e),
+                            ))?;
                             results.push(item);
                         }
                     }
@@ -732,10 +875,10 @@ impl Client {
             Ok(results)
         })
         .await
-        .map_err(|join_err| ClientError {
-            code: 0,
-            message: format!("Decompression task failed: {}", join_err),
-        })??;
+        .map_err(|join_err| ClientError::new(
+            0,
+            format!("Decompression task failed: {}", join_err),
+        ))??;
 
         Ok(results)
     }
@@ -745,22 +888,22 @@ impl Client {
 
 fn map_error<T: std::fmt::Debug>(err: xyo_openapi_client::apis::Error<T>) -> ClientError {
     match err {
-        xyo_openapi_client::apis::Error::ResponseError(rc) => ClientError {
-            code: rc.status.as_u16(),
-            message: rc.content,
-        },
-        xyo_openapi_client::apis::Error::Reqwest(e) => ClientError {
-            code: e.status().map(|s| s.as_u16()).unwrap_or(0),
-            message: e.to_string(),
-        },
-        xyo_openapi_client::apis::Error::Serde(e) => ClientError {
-            code: 0,
-            message: e.to_string(),
-        },
-        xyo_openapi_client::apis::Error::Io(e) => ClientError {
-            code: 0,
-            message: e.to_string(),
-        },
+        xyo_openapi_client::apis::Error::ResponseError(rc) => {
+            let code = rc.status.as_u16();
+            let rate_limit = extract_rate_limit_headers(&rc.headers)
+                .or_else(|| if code == 429 { Some(RateLimitError::default()) } else { None });
+            ClientError {
+                code,
+                message: rc.content,
+                rate_limit,
+            }
+        }
+        xyo_openapi_client::apis::Error::Reqwest(e) => ClientError::new(
+            e.status().map(|s| s.as_u16()).unwrap_or(0),
+            e.to_string(),
+        ),
+        xyo_openapi_client::apis::Error::Serde(e) => ClientError::new(0, e.to_string()),
+        xyo_openapi_client::apis::Error::Io(e) => ClientError::new(0, e.to_string()),
     }
 }
 
@@ -916,6 +1059,7 @@ mod tests {
                 status: reqwest::StatusCode::FORBIDDEN,
                 content: "Forbidden action".to_string(),
                 entity: None,
+                headers: reqwest::header::HeaderMap::new(),
             });
 
         let client_err = map_error(err);
@@ -1012,13 +1156,21 @@ mod tests {
 
         let crlf1 = validate_api_user(Some("user\r\ninjected-header: val"));
         assert!(crlf1.is_err());
-        assert_eq!(
-            crlf1.unwrap_err().message,
-            "api_user contains invalid CRLF characters"
-        );
+        assert!(crlf1.unwrap_err().message.contains("CRLF"));
 
         let crlf2 = validate_api_user(Some("user\ninjected-header: val"));
         assert!(crlf2.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_enrich_transaction_rejects_api_user() {
+        let client = Client::new("test-token", Some("https://api.xyo.financial".to_string())).unwrap();
+        let opts = RequestOptions::new().api_user("user-123");
+        let err = client
+            .enrich_transaction_with_options("COSTA", "GB", Some(&opts))
+            .await
+            .expect_err("api_user should be rejected for single transaction");
+        assert_eq!(err.message, "`api_user` is only applicable to bulk operations");
     }
 
     #[test]
@@ -1038,5 +1190,38 @@ mod tests {
         *key_holder.lock().unwrap() = "rotated-key-2".to_string();
         let cfg2 = client.get_effective_config();
         assert_eq!(cfg2.bearer_access_token, Some("rotated-key-2".to_string()));
+    }
+
+    #[test]
+    fn test_validate_header_value_crlf_rejection() {
+        assert!(validate_header_value(Some("valid-header-val")).is_ok());
+        assert!(validate_header_value(None).is_ok());
+
+        let crlf1 = validate_header_value(Some("val\r\ninjected-header: bad"));
+        assert!(crlf1.is_err());
+        assert_eq!(
+            crlf1.unwrap_err().message,
+            "header value contains invalid CRLF characters"
+        );
+
+        let crlf2 = validate_header_value(Some("val\ninjected-header: bad"));
+        assert!(crlf2.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_enrich_transactions_lazy_iterator_limit() {
+        let client = Client::new("test-token", Some("https://api.xyo.financial".to_string())).unwrap();
+
+        let infinite_requests = std::iter::repeat_with(|| EnrichmentRequest {
+            content: "COSTA COFFEE".to_string(),
+            country_code: "GB".to_string(),
+        });
+
+        let err = client
+            .enrich_transactions(infinite_requests, None)
+            .await
+            .expect_err("infinite requests iterator should terminate early with error");
+
+        assert!(err.message.contains("requests batch size exceeds maximum allowed limit"));
     }
 }

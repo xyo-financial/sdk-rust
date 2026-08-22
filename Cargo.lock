@@ -1646,6 +1646,7 @@ name = "xyo-sdk"
 version = "2.0.0"
 dependencies = [
  "flate2",
+ "httpdate",
  "reqwest",
  "serde",
  "serde_json",
